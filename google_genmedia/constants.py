@@ -87,6 +87,12 @@ VEO3_VALID_SAMPLE_COUNT = (1, 2, 3, 4)
 VIDEO_MIME_TYPES = ["video/mp4", "video/mpeg"]
 VTO_MODEL = "virtual-try-on-001"
 VTO_USER_AGENT = "cloud-solutions/virtual-try-on-custom-node-v1"
+GEMINI_OMNI_USER_AGENT = (
+    "cloud-solutions/comfyui-gemini-omni-custom-node-v1"
+)
+GEMINI_OMNI_VALID_DURATION_SECONDS = (3, 4, 5, 6, 7, 8, 9, 10)
+GEMINI_OMNI_OUTPUT_RESOLUTION = ["720p"]
+GEMINI_OMNI_VALID_ASPECT_RATIOS = ("16:9", "9:16")
 
 
 class GeminiFlashImageModel(Enum):
@@ -110,7 +116,6 @@ class Gemini35Model(Enum):
 class GeminiProImageModel(Enum):
     GEMINI_3_PRO_IMAGE = "gemini-3-pro-image"
 
-
 class ThresholdOptions(Enum):
     BLOCK_NONE = types.HarmBlockThreshold.BLOCK_NONE
     BLOCK_ONLY_HIGH = types.HarmBlockThreshold.BLOCK_ONLY_HIGH
@@ -122,3 +127,6 @@ class Veo3Model(str, Enum):
     VEO_3_1 = "veo-3.1-generate-001"
     VEO_3_1_FAST = "veo-3.1-fast-generate-001"
     VEO_3_1_LITE = "veo-3.1-lite-generate-001"
+
+class GeminiOmniModel(str, Enum):
+    GEMINI_OMNI_FLASH = "gemini-omni-flash-preview"

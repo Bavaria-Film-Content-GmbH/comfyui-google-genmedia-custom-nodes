@@ -915,6 +915,104 @@ def process_video_response(operation: Any) -> List[str]:
     logger.info(f"Successfully processed and saved {len(video_paths)} videos.")
     return video_paths
 
+def process_video_from_interaction(interaction: Any) -> Tuple[List[str], str, str]:
+    """
+    Processes the video generation operation response and saves generated videos.
+
+    Args:
+        interaction: The interaction object from the Gemini API.
+
+    Returns:
+        A list of file paths to the saved video files.
+
+    Raises:
+        APIExecutionError: If no video data is found in the API response or if saving fails.
+    """
+    # store the output in temp directory. The video will be previewed using Preview custom node custom node and saved in output dir if needed
+    output_dir = folder_paths.get_temp_directory()
+    os.makedirs(output_dir, exist_ok=True)
+
+    video_paths: List[str] = []
+    videos_data: List[Any] = []
+    text_chunks: List[str] = []
+
+    logger.info("Starting to process interaction response")
+
+    steps = interaction.steps if isinstance(interaction.steps, list) else []
+
+    logger.info(f"Interaction consists of {len(steps)} steps.")
+
+    for step in reversed(steps):
+        step_type = step.get('type')
+        logger.info(f"Process step of type {step_type}.")
+
+        if step_type == "user_input":
+            break
+        if step_type != "model_output":
+            # if collecting:
+            #     break
+            continue
+
+        content = step.get("content")
+
+        if not isinstance(content, list):
+            continue
+
+        text_parts: List[str] = []
+
+        logger.info(f"Processing {len(content)} content items for step.")
+
+        for n, part in enumerate(content):
+            part_type = part.get("type")
+            logger.info(f"Process content item of type {part_type}")
+            if part_type == 'text':
+                part_type = part.get("text")
+                text_parts.append(text if isinstance(text, str) else "")
+            elif part_type == 'video':
+                # Video is returned either as inline base64 `data` or, when the
+                # response is delivered to Cloud Storage, as a `uri`.
+                mime_type = part.get('mime_type', 'video/mp4')
+                video_b64 = part.get('data')
+                gcs_uri = part.get('uri')
+
+                timestamp = int(time.time())
+                unique_id = random.randint(1000, 99999)
+                video_filename = f"gemini_omni_{timestamp}_{unique_id}_{n}.mp4"
+                video_path = os.path.join(output_dir, video_filename)
+
+                if video_b64:
+                    with open(video_path, "wb") as f:
+                        f.write(base64.b64decode(video_b64))
+                    video_paths.append(video_path)
+                    logger.info(
+                        f"Saved video {n} from base64 data to {video_path}"
+                    )
+                elif gcs_uri:
+                    if download_gcsuri(download_gcsuri, video_path):
+                        video_paths.append(video_path)
+                    logger.info(
+                        f"Saved video {n} from gcs uri {download_gcsuri} to {video_path}"
+                    )
+                else:
+                    logger.warning(
+                        f"Video {n} could not be saved: Neither base64 data nor gcs uri found on video content item."
+                        f"Skipping this video."
+                    )
+                    logger.warning(
+                        f"Problematic video item structure for video {n}: {part}"
+                    )
+
+        output_text = "".join(text_parts)
+        text_chunks.append(output_text)
+        logger.info(f"Got this output text: {output_text}")
+
+    if not video_paths:
+        raise APIExecutionError(
+            "Failed to save any videos despite successful generation response."
+        )
+
+    logger.info(f"Successfully processed and saved {len(video_paths)} videos.")
+    return (video_paths, "".join(text_chunks), interaction.id)
 
 def validate_gcs_uri_and_image(
     gcs_uri: str, check_object: bool = True
