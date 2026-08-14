@@ -26,6 +26,8 @@ import numpy as np
 import torch
 from moviepy import VideoFileClip
 
+from comfy_api.latest import InputImpl
+
 from .constants import SUPPORTED_VIDEO_EXTENSIONS
 from .custom_exceptions import APIInputError, ConfigurationError
 from .logger import get_node_logger
@@ -287,12 +289,57 @@ class VeoVideoSaveAndPreview:
             return {"ui": {"video": [], "error": str(e)}}
 
 
+class VeoVideoPathsToNativeVideo:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video_paths": ("VEO_VIDEO",),
+                "index": (
+                    "INT",
+                    {"default": 1, "min": 1, "max": 99},
+                ),
+            },
+        }
+    RETURN_TYPES = ("VIDEO",)
+    RETURN_NAMES = ("video",)
+    FUNCTION = "convert"
+    CATEGORY = "Google AI/Utils"
+    OUTPUT_NODE = True
+
+    def convert(self, video_paths, index):
+        try:
+            if len(video_paths) < index:
+                raise APIInputError(f"index is {index}, but 'video_path' only contains {len(video_paths)} elements.")
+
+            video_path = video_paths[index - 1]
+
+            if video_path and isinstance(video_path, str) and video_path.strip():
+                if not os.path.exists(video_path):
+                    raise APIInputError(f"Video file not found: {video_path}")
+
+                video = InputImpl.VideoFromFile(video_paths[index - 1])
+
+                return (video, )
+            else:
+                raise APIInputError("'video_path' must not be empty.")
+        except (APIInputError, ConfigurationError) as e:
+            logger.error(f"An error occurred in VeoVideoPathsToNativeVideo: {str(e)}")
+            return {"ui": {"error": str(e)}}
+        except Exception as e:
+            logger.error(
+                f"An unexpected error occurred in VeoVideoPathsToNativeVideo: {str(e)}"
+            )
+            return {"ui": {"error": str(e)}}
+
 NODE_CLASS_MAPPINGS = {
     "VeoVideoToVHSNode": VeoVideoToVHSNode,
     "VeoVideoSaveAndPreview": VeoVideoSaveAndPreview,
+    "VeoVideoPathsToNativeVideo": VeoVideoPathsToNativeVideo,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "VeoVideoToVHSNode": "Video to VHS",
     "VeoVideoSaveAndPreview": "Preview/Save video",
+    "VeoVideoPathsToNativeVideo": "Veo Video Paths to Native Comfy Video",
 }
