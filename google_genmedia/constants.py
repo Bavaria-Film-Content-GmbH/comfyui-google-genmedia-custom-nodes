@@ -91,8 +91,9 @@ GEMINI_OMNI_USER_AGENT = (
     "cloud-solutions/comfyui-gemini-omni-custom-node-v1"
 )
 GEMINI_OMNI_VALID_DURATION_SECONDS = (3, 4, 5, 6, 7, 8, 9, 10)
-GEMINI_OMNI_OUTPUT_RESOLUTION = ["720p"]
+GEMINI_OMNI_OUTPUT_RESOLUTION = ["360p", "720p", "1080p", "4k"]
 GEMINI_OMNI_VALID_ASPECT_RATIOS = ("16:9", "9:16")
+GEMINI_OMNI_CONTEXT_TYPE = "GEMINI_OMNI_CONTEXT"
 
 
 class GeminiFlashImageModel(Enum):
@@ -130,3 +131,4 @@ class Veo3Model(str, Enum):
 
 class GeminiOmniModel(str, Enum):
     GEMINI_OMNI_FLASH = "gemini-omni-flash-preview"
+    GEMINI_OMNI_1_1_FLASH = "gemini-omni-1.1-flash-preview"
