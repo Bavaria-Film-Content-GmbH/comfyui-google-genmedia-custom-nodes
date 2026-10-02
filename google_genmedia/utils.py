@@ -16,14 +16,16 @@
 
 import base64
 import io
+import json
 import mimetypes
 import os
 import random
 import re
 import time
 import wave
+from datetime import datetime, timezone
 from io import BytesIO
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import folder_paths
 import numpy as np
@@ -915,12 +917,22 @@ def process_video_response(operation: Any) -> List[str]:
     logger.info(f"Successfully processed and saved {len(video_paths)} videos.")
     return video_paths
 
-def process_video_from_interaction(interaction: Any) -> Tuple[List[str], str, str]:
+def process_video_from_interaction(
+    interaction: Any, request_params: Optional[Dict[str, Any]] = None
+) -> Tuple[List[str], str, str]:
     """
     Processes the video generation operation response and saves generated videos.
 
+    Also writes a sidecar JSON history file next to the saved videos, recording the
+    request parameters and the resulting interaction_id/text answer. Interaction state
+    itself lives server-side with an undocumented retention policy, so this local file
+    is the durable record of what a turn actually did if that state later expires.
+
     Args:
         interaction: The interaction object from the Gemini API.
+        request_params: The parameters used for this request (model, prompt, aspect_ratio,
+            output_resolution, duration_seconds, store, previous_interaction_id), recorded
+            into the sidecar history file.
 
     Returns:
         A list of file paths to the saved video files.
@@ -966,8 +978,8 @@ def process_video_from_interaction(interaction: Any) -> Tuple[List[str], str, st
             part_type = part.get("type")
             logger.info(f"Process content item of type {part_type}")
             if part_type == 'text':
-                part_type = part.get("text")
-                text_parts.append(text if isinstance(text, str) else "")
+                text_value = part.get("text")
+                text_parts.append(text_value if isinstance(text_value, str) else "")
             elif part_type == 'video':
                 # Video is returned either as inline base64 `data` or, when the
                 # response is delivered to Cloud Storage, as a `uri`.
@@ -1012,7 +1024,27 @@ def process_video_from_interaction(interaction: Any) -> Tuple[List[str], str, st
         )
 
     logger.info(f"Successfully processed and saved {len(video_paths)} videos.")
-    return (video_paths, "".join(text_chunks), interaction.id)
+
+    text_answer = "".join(text_chunks)
+    interaction_id = interaction.id
+
+    history_filename = os.path.splitext(os.path.basename(video_paths[0]))[0] + ".json"
+    history_path = os.path.join(output_dir, history_filename)
+    history_record = {
+        "interaction_id": interaction_id,
+        "text_answer": text_answer,
+        "video_paths": video_paths,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        **(request_params or {}),
+    }
+    try:
+        with open(history_path, "w", encoding="utf-8") as f:
+            json.dump(history_record, f, indent=2)
+        logger.info(f"Wrote interaction history to {history_path}")
+    except OSError as e:
+        logger.warning(f"Could not write interaction history to {history_path}: {e}")
+
+    return (video_paths, text_answer, interaction_id)
 
 def validate_gcs_uri_and_image(
     gcs_uri: str, check_object: bool = True
@@ -1134,6 +1166,40 @@ def tensor_to_pil_to_bytes(image: torch.tensor, format="PNG") -> bytes:
     buffered = io.BytesIO()
     pil_image.save(buffered, format=format)
     return buffered.getvalue()
+
+
+def video_input_to_base64(video: Any, mime_type: str = "video/mp4") -> str:
+    """Reads a ComfyUI VIDEO input's raw bytes and base64-encodes them.
+
+    Uses `get_stream_source()` so file-backed videos (the common case, e.g. a
+    `LoadVideo` node) are read as-is instead of being re-encoded.
+
+    Args:
+        video: A ComfyUI VIDEO input (`comfy_api.latest.input.VideoInput`).
+        mime_type: The MIME type to report for the encoded video; this does not
+            change the bytes read, only the label attached to them.
+
+    Returns:
+        The base64-encoded video bytes as a string.
+
+    Raises:
+        APIExecutionError: If the video bytes could not be read.
+    """
+    try:
+        source = video.get_stream_source()
+        if isinstance(source, str):
+            with open(source, "rb") as f:
+                video_bytes = f.read()
+        else:
+            source.seek(0)
+            video_bytes = source.read()
+    except Exception as e:
+        raise APIExecutionError(f"Failed to read video input for upload: {e}") from e
+
+    if not video_bytes:
+        raise APIExecutionError("Video input is empty; nothing to upload.")
+
+    return base64.b64encode(video_bytes).decode("utf-8")
 
 
 def tensor_to_pil_to_base64(image: torch.tensor, format="PNG") -> bytes:

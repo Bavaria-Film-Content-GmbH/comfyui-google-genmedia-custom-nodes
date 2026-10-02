@@ -18,7 +18,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
-from .constants import GEMINI_OMNI_VALID_ASPECT_RATIOS, GeminiOmniModel
+from .constants import (
+    GEMINI_OMNI_CONTEXT_TYPE,
+    GEMINI_OMNI_OUTPUT_RESOLUTION,
+    GEMINI_OMNI_VALID_ASPECT_RATIOS,
+    GeminiOmniModel,
+)
 from .custom_exceptions import APIExecutionError, APIInputError, ConfigurationError
 from .logger import get_node_logger
 from .gemini_omni_api import GeminiOmniAPI
@@ -41,19 +46,24 @@ class GeminiOmniTextToVideoNode:
                 ),
                 "prompt": ("STRING", {"multiline": True}),
                 "aspect_ratio": (GEMINI_OMNI_VALID_ASPECT_RATIOS, {"default": "16:9"}),
-                "output_resolution": (["720p"], {"default": "720p"}),
+                "output_resolution": (GEMINI_OMNI_OUTPUT_RESOLUTION, {"default": "720p"}),
                 "duration_seconds": (
                     "INT",
                     {"default": 10, "min": 10, "max": 10, "step": 1},
                 ),
             },
             "optional": {
-                "interaction_id": (
-                    "STRING",
+                "context": (
+                    GEMINI_OMNI_CONTEXT_TYPE,
                     {
-                        "default": "",
-                        "multiline": False,
-                        "tooltip": "Use the interaction_id of a previous interaction to continue to track the conversation history and the generated video state without re-uploading the previous video",
+                        "tooltip": "Connect the context output of a previous Gemini Omni node to continue that conversation (its history and generated video state) instead of starting a new one.",
+                    }
+                ),
+                "store": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Keep this turn stored server-side so it can be continued later via its context output. Disable for a faster, one-shot generation that cannot be continued.",
                     }
                 ),
                 "gcp_project_id": (
@@ -73,8 +83,8 @@ class GeminiOmniTextToVideoNode:
             },
         }
 
-    RETURN_TYPES = ("VEO_VIDEO", "STRING", "STRING",)
-    RETURN_NAMES = ("video_paths", "text_answer", "interaction_id")
+    RETURN_TYPES = ("VEO_VIDEO", "STRING", GEMINI_OMNI_CONTEXT_TYPE,)
+    RETURN_NAMES = ("video_paths", "text_answer", "context")
     FUNCTION = "generate"
     CATEGORY = "Google AI/Gemini Omni"
 
@@ -85,24 +95,28 @@ class GeminiOmniTextToVideoNode:
         aspect_ratio: str = "16:9",
         output_resolution: str = "720p",
         duration_seconds: int = 10,
-        interaction_id: Optional[str] = None,
+        context: Optional[Dict[str, Any]] = None,
+        store: bool = True,
         gcp_project_id: Optional[str] = None,
         gcp_region: Optional[str] = None,
-    ) -> Tuple[List[str],str, str]:
+    ) -> Tuple[List[str], str, Dict[str, Any]]:
         """
-        Generates a video from a text prompt using the Google Veo 3.0 API.
+        Generates a video from a text prompt using the Google Gemini Omni API.
 
         Args:
-            model: Veo3 model
+            model: Gemini Omni model.
             prompt: The text prompt for video generation.
             aspect_ratio: The desired aspect ratio of the video.
             output_resolution: The resolution of the generated video.
             duration_seconds: The desired duration of the video in seconds.
-            gcp_project_id: GCP project ID where the Veo will be queried via Vertex AI APIs
-            gcp_region: GCP region for Vertex AI APIs to query Veo
+            context: The context of a previous Gemini Omni turn to continue, if any.
+            store: Whether to keep this turn stored server-side so it can be continued later.
+            gcp_project_id: GCP project ID where Gemini will be queried via Vertex AI APIs.
+            gcp_region: GCP region for Vertex AI APIs to query Gemini.
 
         Returns:
-            A tuple containing a list of file paths to the generated videos.
+            A tuple containing a list of file paths to the generated videos, the text
+            answer, and a context object for continuing this conversation.
 
         Raises:
             RuntimeError: If API configuration fails, or if video generation encounters an API error.
@@ -112,15 +126,22 @@ class GeminiOmniTextToVideoNode:
         except ConfigurationError as e:
             raise RuntimeError(f"Gemini API Configuration Error: {e}") from e
 
+        if context and context.get("model") and context["model"] != model:
+            logger.warning(
+                f"Continuing a conversation started with model '{context['model']}' using "
+                f"a different model '{model}'; cross-model continuation is not documented "
+                "by the API and may not behave as expected."
+            )
 
         try:
-            video_paths, anwswer, interaction_id = api.generate_video_from_text(
+            video_paths, answer, new_interaction_id = api.generate_video_from_text(
                 model=model,
                 prompt=prompt,
                 aspect_ratio=aspect_ratio,
                 output_resolution=output_resolution,
                 duration_seconds=duration_seconds,
-                previous_interaction_id=interaction_id,
+                previous_interaction_id=context.get("interaction_id") if context else None,
+                store=store,
             )
         except APIInputError as e:
             raise RuntimeError(f"Video generation configuration error: {e}") from e
@@ -131,13 +152,19 @@ class GeminiOmniTextToVideoNode:
                 f"An unexpected error occurred during video generation: {e}"
             ) from e
 
-        return (video_paths, anwswer, interaction_id)
+        new_context = {
+            "interaction_id": new_interaction_id,
+            "model": model,
+            "text_answer": answer,
+            "turn": context.get("turn", 0) + 1 if context else 1,
+        }
+        return (video_paths, answer, new_context)
 
 
 class GeminiOmniReferenceToVideo:
     """
-    A ComfyUI node for generating videos from multiple reference images
-    by uploading them to GCS and using the Google Gemini API.
+    A ComfyUI node for generating videos from reference images and/or a
+    reference video using the Google Gemini Omni API.
     """
 
     @classmethod
@@ -151,28 +178,39 @@ class GeminiOmniReferenceToVideo:
                     [model.name for model in GeminiOmniModel],
                     {"default": GeminiOmniModel.GEMINI_OMNI_FLASH.name},
                 ),
-                "image1": ("IMAGE",),
                 "image_format": (
                     ["PNG", "JPEG"],
-                    {"default": "PNG", "tooltip": "MIME type of the image"},
+                    {"default": "PNG", "tooltip": "MIME type of the reference images"},
                 ),
                 "prompt": ("STRING", {"multiline": True}),
                 "aspect_ratio": (GEMINI_OMNI_VALID_ASPECT_RATIOS, {"default": "16:9"}),
-                "output_resolution": (["720p"], {"default": "720p"}),
+                "output_resolution": (GEMINI_OMNI_OUTPUT_RESOLUTION, {"default": "720p"}),
                 "duration_seconds": (
                     "INT",
                     {"default": 10, "min": 10, "max": 10, "step": 1},
                 ),
             },
             "optional": {
+                "image1": ("IMAGE",),
                 "image2": ("IMAGE",),
                 "image3": ("IMAGE",),
-                "interaction_id": (
-                    "STRING",
+                "video": (
+                    "VIDEO",
                     {
-                        "default": "",
-                        "multiline": False,
-                        "tooltip": "Use the interaction_id of a previous interaction to continue to track the conversation history and the generated video state without re-uploading the previous video",
+                        "tooltip": "An optional video to edit or extend. Per the Gemini Omni API, videos used for editing/extension must be 10 seconds or less unless continuing a stored conversation via context.",
+                    },
+                ),
+                "context": (
+                    GEMINI_OMNI_CONTEXT_TYPE,
+                    {
+                        "tooltip": "Connect the context output of a previous Gemini Omni node to continue that conversation (its history and generated video state) instead of starting a new one.",
+                    }
+                ),
+                "store": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Keep this turn stored server-side so it can be continued later via its context output. Disable for a faster, one-shot generation that cannot be continued.",
                     }
                 ),
                 "gcp_project_id": (
@@ -192,44 +230,54 @@ class GeminiOmniReferenceToVideo:
             },
         }
 
-    RETURN_TYPES = ("VEO_VIDEO", "STRING", "STRING",)
-    RETURN_NAMES = ("video_paths", "text_answer", "interaction_id")
+    RETURN_TYPES = ("VEO_VIDEO", "STRING", GEMINI_OMNI_CONTEXT_TYPE,)
+    RETURN_NAMES = ("video_paths", "text_answer", "context")
     FUNCTION = "generate_from_references"
     CATEGORY = "Google AI/Gemini Omni"
 
     def generate_from_references(
         self,
         model: str,
-        image1: torch.Tensor,
         image_format: str,
         prompt: str,
         aspect_ratio: str,
         output_resolution: str,
         duration_seconds: int,
+        image1: Optional[torch.Tensor] = None,
         image2: Optional[torch.Tensor] = None,
         image3: Optional[torch.Tensor] = None,
-        interaction_id: Optional[str] = None,
+        video: Optional[Any] = None,
+        context: Optional[Dict[str, Any]] = None,
+        store: bool = True,
         gcp_project_id: Optional[str] = None,
         gcp_region: Optional[str] = None,
-    ) -> Tuple[List[str], str, str]:
+    ) -> Tuple[List[str], str, Dict[str, Any]]:
         try:
             api = GeminiOmniAPI(project_id=gcp_project_id, region=gcp_region)
         except ConfigurationError as e:
             raise RuntimeError(f"Gemini API Configuration Error: {e}") from e
 
+        if context and context.get("model") and context["model"] != model:
+            logger.warning(
+                f"Continuing a conversation started with model '{context['model']}' using "
+                f"a different model '{model}'; cross-model continuation is not documented "
+                "by the API and may not behave as expected."
+            )
 
         try:
-            video_paths, anwswer, interaction_id = api.generate_video_from_references(
+            video_paths, answer, new_interaction_id = api.generate_video_from_references(
                 model=model,
                 prompt=prompt,
                 image1=image1,
                 image2=image2,
                 image3=image3,
+                video=video,
                 image_format=image_format,
                 aspect_ratio=aspect_ratio,
                 output_resolution=output_resolution,
                 duration_seconds=duration_seconds,
-                previous_interaction_id=interaction_id,
+                previous_interaction_id=context.get("interaction_id") if context else None,
+                store=store,
             )
         except APIInputError as e:
             raise RuntimeError(f"Video generation configuration error: {e}") from e
@@ -240,7 +288,60 @@ class GeminiOmniReferenceToVideo:
                 f"An unexpected error occurred during video generation: {e}"
             ) from e
 
-        return (video_paths, anwswer, interaction_id)
+        new_context = {
+            "interaction_id": new_interaction_id,
+            "model": model,
+            "text_answer": answer,
+            "turn": context.get("turn", 0) + 1 if context else 1,
+        }
+        return (video_paths, answer, new_context)
+
+
+class GeminiOmniLoadContext:
+    """
+    A ComfyUI node for resuming a Gemini Omni conversation from a previously
+    seen interaction_id, e.g. after restarting ComfyUI or reloading a workflow.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls) -> Dict[str, Dict[str, Any]]:
+        return {
+            "required": {
+                "interaction_id": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": False,
+                        "tooltip": "A previously seen interaction_id to resume as a context you can wire into a Gemini Omni node.",
+                    },
+                ),
+            },
+            "optional": {
+                "model": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "tooltip": "Optional: the model the conversation was started with, for reference only.",
+                    },
+                ),
+            },
+        }
+
+    RETURN_TYPES = (GEMINI_OMNI_CONTEXT_TYPE,)
+    RETURN_NAMES = ("context",)
+    FUNCTION = "load"
+    CATEGORY = "Google AI/Gemini Omni"
+
+    def load(self, interaction_id: str, model: str = "") -> Tuple[Dict[str, Any]]:
+        if not interaction_id or not interaction_id.strip():
+            raise RuntimeError("interaction_id cannot be empty.")
+
+        return ({
+            "interaction_id": interaction_id.strip(),
+            "model": model.strip(),
+            "text_answer": "",
+            "turn": 0,
+        },)
 
 
 NODE_CLASS_MAPPINGS = {
@@ -248,11 +349,13 @@ NODE_CLASS_MAPPINGS = {
     # "Veo3GcsUriImageToVideoNode": Veo3GcsUriImageToVideoNode,
     # "Veo3ImageToVideoNode": Veo3ImageToVideoNode,
     "GeminiOmniReferenceToVideo": GeminiOmniReferenceToVideo,
+    "GeminiOmniLoadContext": GeminiOmniLoadContext,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "GeminiOmniTextToVideoNode": "Gemini Omni Text To Video",
     # "Veo3GcsUriImageToVideoNode": "Veo3.1 Image To Video (GcsUriImage)",
     # "Veo3ImageToVideoNode": "Veo3.1 Image To Video",
-    "GeminiOmniReferenceToVideo": "Gemini Omni Reference To Video",
+    "GeminiOmniReferenceToVideo": "Gemini Omni Reference/Video To Video",
+    "GeminiOmniLoadContext": "Gemini Omni Load Context",
 }

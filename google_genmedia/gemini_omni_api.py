@@ -14,10 +14,11 @@
 
 # This is a preview version of gemini omni custom node
 
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import torch
 from google import genai
+from google.genai import errors as genai_errors
 
 from PIL import Image as PIL_Image
 
@@ -58,6 +59,38 @@ class GeminiOmniAPI(VertexAIClient):
             gcp_project_id=project_id, gcp_region=region, user_agent=GEMINI_OMNI_USER_AGENT
         )
 
+    @staticmethod
+    def _raise_interaction_error(
+        error: Exception, previous_interaction_id: Optional[str]
+    ) -> None:
+        """
+        Maps an interactions.create() failure to a clear APIExecutionError.
+
+        Continuing a conversation can fail for several reasons the API doesn't
+        distinguish cleanly: the referenced interaction was never stored (created
+        with store=False), or its server-side availability window - undocumented,
+        and observed to be short enough that continuing across separate ComfyUI runs
+        can already fail even for a freshly stored interaction - has passed. This has
+        been observed as a 400 "malformed format" on the interaction id in one case
+        and a 400 "Precondition check failed" in another, so both are matched here to
+        give an actionable error instead of a raw API error.
+        """
+        if previous_interaction_id and isinstance(error, genai_errors.ClientError):
+            message = str(getattr(error, "message", "") or error)
+            message_lower = message.lower()
+            if (
+                previous_interaction_id in message
+                or "interaction id" in message_lower
+                or "precondition" in message_lower
+            ):
+                raise APIExecutionError(
+                    f"The conversation to continue (interaction_id={previous_interaction_id}) "
+                    "is not available on the server - it may have expired, or it was never "
+                    "stored because the turn that created it had 'store' disabled. Start a "
+                    "new conversation instead."
+                ) from error
+        raise APIExecutionError(f"Gemini API Call failed: {error}") from error
+
     def generate_video_from_text(
         self,
         model: str,
@@ -65,7 +98,8 @@ class GeminiOmniAPI(VertexAIClient):
         aspect_ratio: str,
         duration_seconds: int,
         output_resolution: str,
-        previous_interaction_id: Optional[str] = None
+        previous_interaction_id: Optional[str] = None,
+        store: bool = True,
     ) -> Tuple[List[str], str, str]:
         """
         Generates video from a text prompt using the Gemini Omni API.
@@ -76,6 +110,10 @@ class GeminiOmniAPI(VertexAIClient):
             aspect_ratio: The desired aspect ratio of the video (e.g., "16:9", "1:1").
             duration_seconds: The desired duration of the video in seconds (3-10 seconds).
             output_resolution: The resolution of the generated video.
+            previous_interaction_id: The interaction_id of a prior turn to continue from.
+            store: Whether the interaction should be stored server-side. Required for
+                `previous_interaction_id` to be usable by a later turn; when False the
+                call is a faster, one-shot generation that cannot be continued.
 
         Returns:
             A list of file paths to the generated videos.
@@ -104,7 +142,8 @@ class GeminiOmniAPI(VertexAIClient):
         # Make the API call
         try:
             logger.info(
-                f"Making Gemini API call with the following Model : {model}"
+                f"Making Gemini API call with the following Model : {model}, "
+                f"previous_interaction_id={previous_interaction_id!r}, store={store}"
             )
             response_format={
                 "type": "video", # optional
@@ -119,31 +158,46 @@ class GeminiOmniAPI(VertexAIClient):
             response = self.client.interactions.create(
                 input=prompt,
                 model=model.value,
-                # background=false,
-                # store=false,
-                # stream=false,
-                # previous_interaction_id=previous_interaction_id,
+                background=False,
+                store=store,
+                stream=False,
+                previous_interaction_id=previous_interaction_id,
                 response_format=response_format
             )
         except Exception as e:
-             raise APIExecutionError(f"Gemini API Call failed: {e}") from e
+            self._raise_interaction_error(e, previous_interaction_id)
+
+        logger.info(f"Interaction created with id={response.id!r}")
 
         # Process the response
-        return utils.process_video_from_interaction(response)
+        return utils.process_video_from_interaction(
+            response,
+            request_params={
+                "model": model.value,
+                "prompt": prompt,
+                "aspect_ratio": aspect_ratio,
+                "output_resolution": output_resolution,
+                "duration_seconds": duration_seconds,
+                "store": store,
+                "previous_interaction_id": previous_interaction_id,
+            },
+        )
 
 
     def generate_video_from_references(
         self,
         model: str,
         prompt: str,
-        image1: torch.Tensor,
+        image1: Optional[torch.Tensor],
         image_format: str,
         aspect_ratio: str,
         duration_seconds: int,
         output_resolution: str,
         image2: Optional[torch.Tensor],
         image3: Optional[torch.Tensor],
-        previous_interaction_id: Optional[str] = None
+        video: Optional[Any] = None,
+        previous_interaction_id: Optional[str] = None,
+        store: bool = True,
     ) -> Tuple[List[str], str, str]:
         """
         Generates a video from the references.
@@ -158,6 +212,12 @@ class GeminiOmniAPI(VertexAIClient):
             output_resolution: The resolution of the generated video.
             image2: The second optional reference image.
             image3: The third optional reference image.
+            video: An optional ComfyUI VIDEO input to edit or extend. Per the Gemini Omni
+                API, an input video used for editing/extension must be 10 seconds or less.
+            previous_interaction_id: The interaction_id of a prior turn to continue from.
+            store: Whether the interaction should be stored server-side. Required for
+                `previous_interaction_id` to be usable by a later turn; when False the
+                call is a faster, one-shot generation that cannot be continued.
 
         Returns:
             A list of file paths to the generated videos.
@@ -168,9 +228,9 @@ class GeminiOmniAPI(VertexAIClient):
         """
         if not prompt or not isinstance(prompt, str) or len(prompt.strip()) == 0:
             raise APIInputError("Prompt cannot be empty for text-to-video generation.")
-        if image1 is None:
+        if image1 is None and video is None:
             raise APIInputError(
-                "Image1 is required. At least reference image must be provided."
+                "At least one reference image or a video must be provided."
             )
         if duration_seconds not in GEMINI_OMNI_VALID_DURATION_SECONDS:
             raise APIInputError(
@@ -207,12 +267,18 @@ class GeminiOmniAPI(VertexAIClient):
 
                 input.append(reference_image)
 
+        if video is not None:
+            video_b64 = utils.video_input_to_base64(video)
+            input.append({"type": "video", "data": video_b64, "mime_type": "video/mp4"})
+            logger.info("Added video input to the request.")
+
         model = GeminiOmniModel[model]
 
         # Make the API call
         try:
             logger.info(
-                f"Making Gemini API call with the following Model : {model}"
+                f"Making Gemini API call with the following Model : {model}, "
+                f"previous_interaction_id={previous_interaction_id!r}, store={store}"
             )
             response_format={
                 "type": "video", # optional
@@ -229,6 +295,10 @@ class GeminiOmniAPI(VertexAIClient):
             response = self.client.interactions.create(
                 input=input,
                 model=model.value,
+                background=False,
+                store=store,
+                stream=False,
+                previous_interaction_id=previous_interaction_id,
                 response_format=response_format,
                 # generation_config={
                 #     "video_config": {
@@ -237,7 +307,20 @@ class GeminiOmniAPI(VertexAIClient):
                 # }
             )
         except Exception as e:
-             raise APIExecutionError(f"Gemini API Call failed: {e}") from e
+            self._raise_interaction_error(e, previous_interaction_id)
+
+        logger.info(f"Interaction created with id={response.id!r}")
 
         # Process the response
-        return utils.process_video_from_interaction(response)
+        return utils.process_video_from_interaction(
+            response,
+            request_params={
+                "model": model.value,
+                "prompt": prompt,
+                "aspect_ratio": aspect_ratio,
+                "output_resolution": output_resolution,
+                "duration_seconds": duration_seconds,
+                "store": store,
+                "previous_interaction_id": previous_interaction_id,
+            },
+        )
