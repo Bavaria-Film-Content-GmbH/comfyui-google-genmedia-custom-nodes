@@ -148,6 +148,7 @@ class GeminiOmniAPI(VertexAIClient):
             response_format={
                 "type": "video", # optional
                 "aspect_ratio": aspect_ratio,
+                "resolution": output_resolution,
                 # "duration": str(duration_seconds),
                 # "gcs_uri": ""
             }
@@ -283,6 +284,7 @@ class GeminiOmniAPI(VertexAIClient):
             response_format={
                 "type": "video", # optional
                 "aspect_ratio": aspect_ratio,
+                "resolution": output_resolution,
                 # "duration": str(duration_seconds),
                 # "gcs_uri": ""
             }
