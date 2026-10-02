@@ -49,7 +49,7 @@ class GeminiOmniTextToVideoNode:
                 "output_resolution": (GEMINI_OMNI_OUTPUT_RESOLUTION, {"default": "720p"}),
                 "duration_seconds": (
                     "INT",
-                    {"default": 10, "min": 10, "max": 10, "step": 1},
+                    {"default": 10, "min": 3, "max": 10, "step": 1},
                 ),
             },
             "optional": {
@@ -187,7 +187,7 @@ class GeminiOmniReferenceToVideo:
                 "output_resolution": (GEMINI_OMNI_OUTPUT_RESOLUTION, {"default": "720p"}),
                 "duration_seconds": (
                     "INT",
-                    {"default": 10, "min": 10, "max": 10, "step": 1},
+                    {"default": 10, "min": 3, "max": 10, "step": 1},
                 ),
             },
             "optional": {
